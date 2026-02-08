@@ -1,0 +1,201 @@
+import sys
+sys.path.insert(0, '/home/sifaoui/lcd')
+import time
+import board
+import adafruit_dht
+import drivers
+import spidev
+import RPi.GPIO as GPIO
+from email.mime.text import MIMEText
+from datetime import datetime
+import smtplib
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import db
+
+# Configuration Firebase
+cred = credentials.Certificate('/home/sifaoui/lcd/py-spidev/fraisier-fa1be-firebase-adminsdk-fbsvc-4f9cc3ec8b.json')
+firebase_admin.initialize_app(cred, {
+    'databaseURL': 'https://fraisier-fa1be-default-rtdb.firebaseio.com/'
+})
+ref = db.reference('/sensor_data')
+
+# Configuration Email
+EMAIL = "sifaouisamar03@gmail.com"
+DESTINATAIRE = "sifaouisamar03@gmail.com"
+MDP = "**** **** **** ****"
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 465
+
+# Configuration matérielle
+import board
+from adafruit_blinka.board.raspberrypi.raspi_4b import D17  # Pour Raspberry Pi 4
+
+dht = adafruit_dht.DHT22(D17)
+display = drivers.Lcd()
+
+# GPIO
+POMPE_GPIO = 26
+LED_POMPE = 16
+LED_VERTE = 5
+LED_ROUGE = 6
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup(POMPE_GPIO, GPIO.OUT, initial=GPIO.HIGH)
+GPIO.setup(LED_POMPE, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(LED_VERTE, GPIO.OUT, initial=GPIO.LOW)
+GPIO.setup(LED_ROUGE, GPIO.OUT, initial=GPIO.LOW)
+
+# SPI
+spi = spidev.SpiDev()
+spi.open(0, 0)
+spi.max_speed_hz = 1350000
+
+SEUIL_SEC = 950
+SEUIL_HUMIDE = 250
+MIN_RESERVOIR = 100
+MAX_RESERVOIR = 950
+
+def lire_canal(canal):
+    cmd = 0b11000000 | (canal << 3)
+    reponse = spi.xfer2([cmd, 0x00, 0x00])
+    return ((reponse[0] & 0x01) << 9) | (reponse[1] << 1) | (reponse[2] >> 7)
+
+def humidite_sol():
+    raw = lire_canal(0)
+    return max(0, min(100, (SEUIL_SEC - raw) / (SEUIL_SEC - SEUIL_HUMIDE) * 100))
+
+def niveau_reservoir():
+    raw = lire_canal(1)
+    return max(0, min(100, (raw - MIN_RESERVOIR) / (MAX_RESERVOIR - MIN_RESERVOIR) * 100))
+
+def envoyer_alerte(sujet, message):
+    try:
+        msg = MIMEText(f"{message}\n\nDate: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+        msg['Subject'] = sujet
+        msg['From'] = EMAIL
+        msg['To'] = DESTINATAIRE
+
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=10) as srv:
+            srv.login(EMAIL, MDP)
+            srv.send_message(msg)
+        print(f"Alerte envoyée: {sujet}")
+    except Exception as e:
+        print(f"Erreur email: {str(e)}")
+
+def gestion_leds(pompe_active, niveau_eau):
+    current_time = time.time()
+
+    if not hasattr(gestion_leds, "led_pompe_etat"):
+        gestion_leds.led_pompe_etat = False
+        gestion_leds.last_toggle_pompe = 0
+        gestion_leds.led_verte_etat = False
+        gestion_leds.last_toggle_verte = 0
+
+    # LED Pompe
+    if pompe_active:
+        if current_time - gestion_leds.last_toggle_pompe >= 0.5:
+            gestion_leds.led_pompe_etat = not gestion_leds.led_pompe_etat
+            GPIO.output(LED_POMPE, gestion_leds.led_pompe_etat)
+            gestion_leds.last_toggle_pompe = current_time
+    else:
+        GPIO.output(LED_POMPE, GPIO.LOW)
+        gestion_leds.led_pompe_etat = False
+
+    # LED Réservoir
+    if niveau_eau <= 0:
+        GPIO.output(LED_ROUGE, GPIO.HIGH)
+        GPIO.output(LED_VERTE, GPIO.LOW)
+    elif niveau_eau < 10:
+        if current_time - gestion_leds.last_toggle_verte >= 0.5:
+            gestion_leds.led_verte_etat = not gestion_leds.led_verte_etat
+            GPIO.output(LED_VERTE, gestion_leds.led_verte_etat)
+            gestion_leds.last_toggle_verte = current_time
+        GPIO.output(LED_ROUGE, GPIO.LOW)
+    else:
+        GPIO.output(LED_VERTE, GPIO.HIGH)
+        GPIO.output(LED_ROUGE, GPIO.LOW)
+        gestion_leds.led_verte_etat = True
+
+try:
+    dernier_activation = 0
+    etat_pompe = False
+    alerte_envoyee = False
+    alerte_temp = None
+    last_firebase_update = 0
+
+    while True:
+        try:
+            temp = dht.temperature
+            hum = dht.humidity
+            hum_sol = humidite_sol()
+            niv_res = niveau_reservoir()
+        except RuntimeError as e:
+            print(f"Erreur capteur: {str(e)}")
+            time.sleep(2)
+            continue
+
+        # Envoi des données à Firebase toutes les 10 secondes
+        if time.time() - last_firebase_update >= 10:
+            try:
+                data = {
+                    'timestamp': datetime.now().isoformat(),
+                    'temperature': temp,
+                    'humidity_air': hum,
+                    'humidity_soil': hum_sol,
+                    'water_level': niv_res,
+                    'pump_active': etat_pompe
+                }
+                ref.push().set(data)
+                last_firebase_update = time.time()
+                print("Données Firebase mises à jour")
+            except Exception as e:
+                print(f"Erreur Firebase: {str(e)}")
+
+        # Gestion température avec envoi d'email
+        if temp is not None:
+            if temp < 10 and alerte_temp != 'basse':
+                envoyer_alerte("Température trop basse", f"La température est de {temp:.1f}°C")
+                alerte_temp = 'basse'
+            elif 12 <= temp <= 25 and alerte_temp != 'ideale':
+                envoyer_alerte("Température idéale", f"La température est idéale : {temp:.1f}°C")
+                alerte_temp = 'ideale'
+            elif temp > 30 and alerte_temp != 'haute':
+                envoyer_alerte("Température trop élevée", f"La température est de {temp:.1f}°C")
+                alerte_temp = 'haute'
+
+        if hum_sol < 60 and not etat_pompe:
+            GPIO.output(POMPE_GPIO, GPIO.LOW)
+            etat_pompe = True
+            envoyer_alerte("POMPE ACTIVÉE", f"Humidité sol: {hum_sol:.1f}%")
+            dernier_activation = time.time()
+
+        elif hum_sol >= 80 and etat_pompe:
+            GPIO.output(POMPE_GPIO, GPIO.HIGH)
+            etat_pompe = False
+            envoyer_alerte("POMPE DÉSACTIVÉE", f"Humidité sol: {hum_sol:.1f}%")
+
+        if niv_res <= 0 and not alerte_envoyee:
+            envoyer_alerte("RÉSERVOIR VIDE!", "Le réservoir est complètement vide!")
+            alerte_envoyee = True
+        elif niv_res > 10:
+            alerte_envoyee = False
+
+        display.lcd_clear()
+        display.lcd_display_string(f"T:{temp:.1f}C H:{hum:.1f}%", 1)
+        display.lcd_display_string(f"Sol:{hum_sol:.1f}% Res:{niv_res:.1f}%", 2)
+
+        gestion_leds(etat_pompe, niv_res)
+
+        time.sleep(1)
+
+except KeyboardInterrupt:
+    print("\nArrêt du système...")
+    GPIO.output(POMPE_GPIO, GPIO.HIGH)
+    GPIO.output(LED_POMPE, GPIO.LOW)
+    GPIO.output(LED_VERTE, GPIO.LOW)
+    GPIO.output(LED_ROUGE, GPIO.LOW)
+    display.lcd_clear()
+    spi.close()
+    GPIO.cleanup()
